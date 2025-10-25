@@ -6,8 +6,22 @@ __pycache__/
 
 # C extensions
 *.so
-.idea
+.idea/
 .idea*
+
+out
+out*
+
+.DS_Store/
+.DS_Store
+
+__pycache__/
+*.pyc
+.venv/
+.env
+out/
+*.xlsx
+*.json
 
 # Distribution / packaging
 .Python

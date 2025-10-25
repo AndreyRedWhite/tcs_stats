@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcs_stats"
+version = "0.1.0"
+description = "Async Tinkoff Invest stats collector with JSON and Excel export"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "tinkoff-investments>=0.2.0",
+    "pandas>=2.0",
+    "xlsxwriter>=3.1",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+tcs-stats = "tcs_stats.collect:main"
+tcs-stats-excel = "excel_export:main"
