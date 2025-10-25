@@ -18,3 +18,4 @@ dependencies = [
 [project.scripts]
 tcs-stats = "tcs_stats.collect:main"
 tcs-stats-excel = "excel_export:main"
+tcs-stats-report = "tcs_stats.report:main"
