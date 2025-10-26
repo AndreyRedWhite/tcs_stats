@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from tinkoff.invest import AsyncClient, GetOperationsByCursorRequest, OperationState
 
-from tcs_stats.utils import decimal_from_units_nano, round_money, safe_currency, to_utc
+from utils import decimal_from_units_nano, round_money, safe_currency, to_utc
 
 
 # ---- classification helpers --------------------------------------------------
