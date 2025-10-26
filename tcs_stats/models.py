@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, List, Literal, Optional, TypedDict
+from typing import Dict, List, Literal, Optional, TypedDict, NotRequired
 
 WindowKind = Literal["day", "week", "month", "year"]
 
@@ -29,6 +29,14 @@ class WindowRecord(TypedDict):
     kind: WindowKind
     start: str
     end: str
+    currency: str
+    stats: CurrencyBreakdown
+    instruments: NotRequired[List["InstrumentBreakdown"]]
+
+
+class InstrumentBreakdown(TypedDict):
+    instrument_id: str
+    instrument_name: str
     currency: str
     stats: CurrencyBreakdown
 

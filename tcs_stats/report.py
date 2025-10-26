@@ -94,6 +94,7 @@ class StatsResult:
     instruments: List[InstrumentStats]
     totals_by_currency: Dict[str, InstrumentStats]
     daily_totals_by_currency: Dict[date, Dict[str, InstrumentStats]] | None = None
+    daily_instruments: Dict[date, List[InstrumentStats]] | None = None
 
 
 # ---- data helpers ------------------------------------------------------------
@@ -203,12 +204,31 @@ def _apply_amount(stats: InstrumentStats, amount: Decimal, op_type_name: str) ->
             stats.other_out += (-amount)
 
 
+def _matches_filter(op, instrument_filter: str | None) -> bool:
+    if not instrument_filter:
+        return True
+
+    needle = instrument_filter.lower()
+    candidates = []
+
+    for attr in ("instrument_uid", "figi", "ticker", "name", "position_uid"):
+        value = getattr(op, attr, None)
+        if value:
+            candidates.append(str(value).lower())
+
+    instrument_id, instrument_name = _instrument_identity(op)
+    candidates.extend([instrument_id.lower(), instrument_name.lower()])
+
+    return any(needle in candidate for candidate in candidates)
+
+
 async def collect_instrument_stats(
     token: str,
     account_id: str,
     since_local: datetime,
     until_local: datetime,
     tz_name: str,
+    instrument_filter: str | None = None,
 ) -> StatsResult:
     tz = ZoneInfo(tz_name)
     since_local = (
@@ -225,12 +245,17 @@ async def collect_instrument_stats(
     stats_by_instrument: Dict[Tuple[str, str], InstrumentStats] = {}
     totals: Dict[str, InstrumentStats] = {}
     daily_totals: defaultdict[date, Dict[str, InstrumentStats]] = defaultdict(dict)
+    daily_instruments: defaultdict[
+        date, Dict[Tuple[str, str], InstrumentStats]
+    ] = defaultdict(dict)
 
     async with AsyncClient(token) as client:
         since_utc = to_utc(since_local)
         until_utc = to_utc(until_local)
 
         async for op in _iter_operations(client, account_id, since_utc, until_utc):
+            if not _matches_filter(op, instrument_filter):
+                continue
             op_type = getattr(op, "operation_type", None) or getattr(op, "type", None)
             op_type_name = getattr(op_type, "name", "UNSPECIFIED")
             payment = getattr(op, "payment", None)
@@ -254,10 +279,17 @@ async def collect_instrument_stats(
             inst_stats = _ensure_stats(stats_by_instrument, instrument_id, instrument_name, currency)
             total_stats = _ensure_total(totals, currency)
             daily_total_stats = _ensure_total(daily_totals[op_local_date], currency)
+            daily_inst_stats = _ensure_stats(
+                daily_instruments[op_local_date],
+                instrument_id,
+                instrument_name,
+                currency,
+            )
 
             _apply_amount(inst_stats, amount, op_type_name)
             _apply_amount(total_stats, amount, op_type_name)
             _apply_amount(daily_total_stats, amount, op_type_name)
+            _apply_amount(daily_inst_stats, amount, op_type_name)
 
     day_cursor = since_local.date()
     if until_local > since_local:
@@ -266,6 +298,7 @@ async def collect_instrument_stats(
         end_of_range = since_local.date()
     while day_cursor <= end_of_range:
         _ = daily_totals[day_cursor]
+        _ = daily_instruments[day_cursor]
         day_cursor += timedelta(days=1)
 
     return StatsResult(
@@ -278,6 +311,13 @@ async def collect_instrument_stats(
         ),
         totals_by_currency=totals,
         daily_totals_by_currency={day: totals for day, totals in sorted(daily_totals.items())},
+        daily_instruments={
+            day: sorted(
+                instruments.values(),
+                key=lambda s: (s.currency, -s.net_result(), s.instrument_name),
+            )
+            for day, instruments in sorted(daily_instruments.items())
+        },
     )
 
 
@@ -288,10 +328,13 @@ def _format_money(amount: Decimal, currency: str) -> str:
     return f"{round_money(amount, 2):,.2f} {currency}"
 
 
-def _print_instrument_stats(stats: InstrumentStats) -> None:
-    print(f"{stats.instrument_name} [{stats.currency}]")
+def _print_instrument_stats(stats: InstrumentStats, indent: str = "") -> None:
+    print(f"{indent}{stats.instrument_name} [{stats.currency}]")
     print(
-        "  Trades: {total} (buys: {buys}, sells: {sells}, positive: {pos}, negative: {neg})".format(
+        (
+            "{indent}  Trades: {total} (buys: {buys}, sells: {sells}, positive: {pos}, negative: {neg})"
+        ).format(
+            indent=indent,
             total=stats.total_trades,
             buys=stats.buy_trades,
             sells=stats.sell_trades,
@@ -300,21 +343,21 @@ def _print_instrument_stats(stats: InstrumentStats) -> None:
         )
     )
     print(
-        f"  Cash in: {_format_money(stats.cash_in, stats.currency)}, cash out: {_format_money(stats.cash_out, stats.currency)}"
+        f"{indent}  Cash in: {_format_money(stats.cash_in, stats.currency)}, cash out: {_format_money(stats.cash_out, stats.currency)}"
     )
     if stats.dividends:
-        print(f"  Dividends: {_format_money(stats.dividends, stats.currency)}")
+        print(f"{indent}  Dividends: {_format_money(stats.dividends, stats.currency)}")
     if stats.coupons:
-        print(f"  Coupons: {_format_money(stats.coupons, stats.currency)}")
+        print(f"{indent}  Coupons: {_format_money(stats.coupons, stats.currency)}")
     if stats.commissions:
-        print(f"  Commissions: {_format_money(stats.commissions, stats.currency)}")
+        print(f"{indent}  Commissions: {_format_money(stats.commissions, stats.currency)}")
     if stats.taxes:
-        print(f"  Taxes: {_format_money(stats.taxes, stats.currency)}")
+        print(f"{indent}  Taxes: {_format_money(stats.taxes, stats.currency)}")
     if stats.other_in or stats.other_out:
         print(
-            f"  Other in/out: {_format_money(stats.other_in, stats.currency)} / {_format_money(stats.other_out, stats.currency)}"
+            f"{indent}  Other in/out: {_format_money(stats.other_in, stats.currency)} / {_format_money(stats.other_out, stats.currency)}"
         )
-    print(f"  Net result: {_format_money(stats.net_result(), stats.currency)}")
+    print(f"{indent}  Net result: {_format_money(stats.net_result(), stats.currency)}")
     print()
 
 
@@ -333,10 +376,20 @@ def print_report(result: StatsResult) -> None:
             print(day.isoformat())
             if not totals:
                 print("  No operations")
-                print()
-                continue
-            for currency, stats in sorted(totals.items()):
-                _print_instrument_stats(stats)
+            else:
+                for currency, stats in sorted(totals.items()):
+                    _print_instrument_stats(stats, indent="  ")
+
+            day_instruments: List[InstrumentStats] = []
+            if result.daily_instruments:
+                day_instruments = result.daily_instruments.get(day, [])
+
+            if day_instruments:
+                print("  -- Per instrument --")
+                for stats in day_instruments:
+                    _print_instrument_stats(stats, indent="    ")
+
+            print()
 
     print("=== Per instrument ===")
     for stats in result.instruments:
@@ -398,6 +451,10 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Aggregate statistics for the current week (default: current day)",
     )
+    parser.add_argument(
+        "--filter",
+        help="Filter statistics by instrument id, ticker, FIGI or name substring",
+    )
     return parser.parse_args()
 
 
@@ -416,6 +473,7 @@ async def _amain() -> None:
         since_local=since,
         until_local=until,
         tz_name=args.tz,
+        instrument_filter=args.filter,
     )
 
     print_report(result)
