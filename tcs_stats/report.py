@@ -5,7 +5,8 @@ import argparse
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, time
 from decimal import Decimal
 from typing import Dict, List, Tuple
 from zoneinfo import ZoneInfo
@@ -92,6 +93,7 @@ class StatsResult:
     timezone: str
     instruments: List[InstrumentStats]
     totals_by_currency: Dict[str, InstrumentStats]
+    daily_totals_by_currency: Dict[date, Dict[str, InstrumentStats]] | None = None
 
 
 # ---- data helpers ------------------------------------------------------------
@@ -222,6 +224,7 @@ async def collect_instrument_stats(
 
     stats_by_instrument: Dict[Tuple[str, str], InstrumentStats] = {}
     totals: Dict[str, InstrumentStats] = {}
+    daily_totals: defaultdict[date, Dict[str, InstrumentStats]] = defaultdict(dict)
 
     async with AsyncClient(token) as client:
         since_utc = to_utc(since_local)
@@ -238,11 +241,32 @@ async def collect_instrument_stats(
             amount = decimal_from_units_nano(payment.units, payment.nano)
             instrument_id, instrument_name = _instrument_identity(op)
 
+            op_date_raw = getattr(op, "date", None)
+            if isinstance(op_date_raw, datetime):
+                op_local_date = (
+                    op_date_raw.astimezone(tz).date()
+                    if op_date_raw.tzinfo
+                    else op_date_raw.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz).date()
+                )
+            else:
+                op_local_date = since_local.date()
+
             inst_stats = _ensure_stats(stats_by_instrument, instrument_id, instrument_name, currency)
             total_stats = _ensure_total(totals, currency)
+            daily_total_stats = _ensure_total(daily_totals[op_local_date], currency)
 
             _apply_amount(inst_stats, amount, op_type_name)
             _apply_amount(total_stats, amount, op_type_name)
+            _apply_amount(daily_total_stats, amount, op_type_name)
+
+    day_cursor = since_local.date()
+    if until_local > since_local:
+        end_of_range = (until_local - timedelta(microseconds=1)).date()
+    else:
+        end_of_range = since_local.date()
+    while day_cursor <= end_of_range:
+        _ = daily_totals[day_cursor]
+        day_cursor += timedelta(days=1)
 
     return StatsResult(
         since=since_local,
@@ -253,6 +277,7 @@ async def collect_instrument_stats(
             key=lambda s: (s.currency, -s.net_result(), s.instrument_name),
         ),
         totals_by_currency=totals,
+        daily_totals_by_currency={day: totals for day, totals in sorted(daily_totals.items())},
     )
 
 
@@ -301,6 +326,17 @@ def print_report(result: StatsResult) -> None:
     print("\n=== Overall totals ===")
     for currency, stats in sorted(result.totals_by_currency.items()):
         _print_instrument_stats(stats)
+
+    if period == "week" and result.daily_totals_by_currency:
+        print("=== Totals by day ===")
+        for day, totals in sorted(result.daily_totals_by_currency.items()):
+            print(day.isoformat())
+            if not totals:
+                print("  No operations")
+                print()
+                continue
+            for currency, stats in sorted(totals.items()):
+                _print_instrument_stats(stats)
 
     print("=== Per instrument ===")
     for stats in result.instruments:
