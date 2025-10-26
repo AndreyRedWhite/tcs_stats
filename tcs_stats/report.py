@@ -204,12 +204,31 @@ def _apply_amount(stats: InstrumentStats, amount: Decimal, op_type_name: str) ->
             stats.other_out += (-amount)
 
 
+def _matches_filter(op, instrument_filter: str | None) -> bool:
+    if not instrument_filter:
+        return True
+
+    needle = instrument_filter.lower()
+    candidates = []
+
+    for attr in ("instrument_uid", "figi", "ticker", "name", "position_uid"):
+        value = getattr(op, attr, None)
+        if value:
+            candidates.append(str(value).lower())
+
+    instrument_id, instrument_name = _instrument_identity(op)
+    candidates.extend([instrument_id.lower(), instrument_name.lower()])
+
+    return any(needle in candidate for candidate in candidates)
+
+
 async def collect_instrument_stats(
     token: str,
     account_id: str,
     since_local: datetime,
     until_local: datetime,
     tz_name: str,
+    instrument_filter: str | None = None,
 ) -> StatsResult:
     tz = ZoneInfo(tz_name)
     since_local = (
@@ -235,6 +254,8 @@ async def collect_instrument_stats(
         until_utc = to_utc(until_local)
 
         async for op in _iter_operations(client, account_id, since_utc, until_utc):
+            if not _matches_filter(op, instrument_filter):
+                continue
             op_type = getattr(op, "operation_type", None) or getattr(op, "type", None)
             op_type_name = getattr(op_type, "name", "UNSPECIFIED")
             payment = getattr(op, "payment", None)
@@ -430,6 +451,10 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Aggregate statistics for the current week (default: current day)",
     )
+    parser.add_argument(
+        "--filter",
+        help="Filter statistics by instrument id, ticker, FIGI or name substring",
+    )
     return parser.parse_args()
 
 
@@ -448,6 +473,7 @@ async def _amain() -> None:
         since_local=since,
         until_local=until,
         tz_name=args.tz,
+        instrument_filter=args.filter,
     )
 
     print_report(result)

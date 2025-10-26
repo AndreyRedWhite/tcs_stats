@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import DefaultDict, Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo
 
 from tinkoff.invest import (
@@ -20,6 +20,8 @@ from tinkoff.invest import (
 from tinkoff.invest.async_services import AsyncServices
 
 from tcs_stats.models import (
+    CurrencyBreakdown,
+    InstrumentBreakdown,
     MetaInfo,
     RunningTotals,
     StatsJSON,
@@ -27,7 +29,7 @@ from tcs_stats.models import (
     WindowKind,
 )
 from tcs_stats.time_windows import split_into_windows, Window
-from tcs_stats.utils import decimal_from_units_nano, safe_currency, to_utc, round_money
+from tcs_stats.utils import decimal_from_units_nano, safe_currency, round_money
 
 
 # ---- classification helpers -------------------------------------------------
@@ -103,6 +105,70 @@ def _bucket_key(kind: WindowKind, start: datetime, currency: str) -> str:
     return f"{kind}::{start.isoformat()}::{currency}"
 
 
+def _instrument_identity(op) -> Tuple[str, str]:
+    uid = getattr(op, "instrument_uid", None)
+    figi = getattr(op, "figi", None)
+    ticker = getattr(op, "ticker", None)
+    name = getattr(op, "name", None)
+    position_uid = getattr(op, "position_uid", None)
+
+    instrument_id = uid or figi or position_uid or "UNSPECIFIED"
+
+    display_parts = []
+    if ticker:
+        display_parts.append(str(ticker))
+    if name and name not in display_parts:
+        display_parts.append(str(name))
+    if not display_parts:
+        display_parts.append(str(figi or uid or position_uid or "Без названия"))
+
+    return instrument_id, " - ".join(display_parts)
+
+
+def _apply_amount(totals: RunningTotals, amount: Decimal, op_type_name: str) -> None:
+    if _is_trade(op_type_name):
+        if amount < 0:
+            totals.trade_buy_cash += (-amount)
+        else:
+            totals.trade_sell_cash += amount
+        totals.turnover += abs(amount)
+    elif _is_fee(op_type_name):
+        totals.commissions += (-amount if amount < 0 else amount)
+    elif _is_tax(op_type_name):
+        totals.taxes += (-amount if amount < 0 else amount)
+    elif _is_dividend(op_type_name):
+        totals.dividends += (amount if amount > 0 else -amount)
+    elif _is_coupon(op_type_name):
+        totals.coupons += (amount if amount > 0 else -amount)
+    elif _is_deposit(op_type_name):
+        totals.deposits += (amount if amount > 0 else -amount)
+    elif _is_withdrawal(op_type_name):
+        totals.withdrawals += (-amount if amount < 0 else amount)
+    else:
+        totals.other += amount
+
+
+def _totals_to_breakdown(t: RunningTotals) -> CurrencyBreakdown:
+    net_excl = (t.trade_sell_cash + t.dividends + t.coupons) - (
+        t.trade_buy_cash + t.commissions + t.taxes
+    )
+    net_incl = net_excl + t.deposits - t.withdrawals
+    return {
+        "turnover": round_money(t.turnover),
+        "trade_buy_cash": round_money(t.trade_buy_cash),
+        "trade_sell_cash": round_money(t.trade_sell_cash),
+        "commissions": round_money(t.commissions),
+        "taxes": round_money(t.taxes),
+        "dividends": round_money(t.dividends),
+        "coupons": round_money(t.coupons),
+        "deposits": round_money(t.deposits),
+        "withdrawals": round_money(t.withdrawals),
+        "other": round_money(t.other),
+        "net_cashflow_excl_deposits": round_money(net_excl),
+        "net_cashflow_incl_deposits": round_money(net_incl),
+    }
+
+
 async def collect_stats(
     token: str,
     account_id: str,
@@ -141,6 +207,9 @@ async def collect_stats(
 
     # Aggregation buckets: key -> currency -> totals
     buckets: Dict[str, Dict[str, RunningTotals]] = defaultdict(_init_bucket)
+    day_instrument_buckets: Dict[
+        Tuple[str, str], Dict[str, Tuple[str, RunningTotals]]
+    ] = defaultdict(dict)
 
     async with AsyncClient(token) as client:
         services = client
@@ -166,6 +235,9 @@ async def collect_stats(
                 continue
             op_local = op_dt.astimezone(tz)
 
+            instrument_id, instrument_name = _instrument_identity(op)
+            has_instrument = instrument_id != "UNSPECIFIED"
+
             # Place operation into all windows that cover its timestamp.
             # For each requested kind we have disjoint, ordered windows.
             for kind, win_list in kind_to_windows.items():
@@ -173,28 +245,16 @@ async def collect_stats(
                 for w in win_list:
                     if w.start <= op_local < w.end:
                         totals = buckets[_bucket_key(w.kind, w.start, cur)][cur]
-                        # Update by category
-                        if _is_trade(op_type_name):
-                            # Buy < 0 cash, Sell > 0 cash; turnover counts abs cash.
-                            if amount < 0:
-                                totals.trade_buy_cash += (-amount)
-                            else:
-                                totals.trade_sell_cash += amount
-                            totals.turnover += abs(amount)
-                        elif _is_fee(op_type_name):
-                            totals.commissions += (-amount if amount < 0 else amount)
-                        elif _is_tax(op_type_name):
-                            totals.taxes += (-amount if amount < 0 else amount)
-                        elif _is_dividend(op_type_name):
-                            totals.dividends += (amount if amount > 0 else -amount)
-                        elif _is_coupon(op_type_name):
-                            totals.coupons += (amount if amount > 0 else -amount)
-                        elif _is_deposit(op_type_name):
-                            totals.deposits += (amount if amount > 0 else -amount)
-                        elif _is_withdrawal(op_type_name):
-                            totals.withdrawals += (-amount if amount < 0 else amount)
-                        else:
-                            totals.other += amount
+                        _apply_amount(totals, amount, op_type_name)
+
+                        if w.kind == "day" and has_instrument:
+                            key = (w.start.isoformat(), cur)
+                            inst_map = day_instrument_buckets[key]
+                            entry = inst_map.get(instrument_id)
+                            if entry is None:
+                                entry = (instrument_name, RunningTotals())
+                                inst_map[instrument_id] = entry
+                            _apply_amount(entry[1], amount, op_type_name)
                         break  # found the window; move to next kind/op
 
     # Build output list
@@ -202,36 +262,42 @@ async def collect_stats(
     for key, by_cur in buckets.items():
         kind_str, start_iso, _cur_key = key.split("::")
         for currency, t in by_cur.items():
-            net_excl = (t.trade_sell_cash + t.dividends + t.coupons) - (
-                t.trade_buy_cash + t.commissions + t.taxes
-            )
-            net_incl = net_excl + t.deposits - t.withdrawals
-            out_windows.append(
-                {
-                    "kind": kind_str,  # type: ignore
-                    "start": start_iso,
-                    "end": next(
-                        w.end.isoformat()
-                        for w in windows
-                        if w.kind == kind_str and w.start.isoformat() == start_iso
-                    ),
-                    "currency": currency,
-                    "stats": {
-                        "turnover": round_money(t.turnover),
-                        "trade_buy_cash": round_money(t.trade_buy_cash),
-                        "trade_sell_cash": round_money(t.trade_sell_cash),
-                        "commissions": round_money(t.commissions),
-                        "taxes": round_money(t.taxes),
-                        "dividends": round_money(t.dividends),
-                        "coupons": round_money(t.coupons),
-                        "deposits": round_money(t.deposits),
-                        "withdrawals": round_money(t.withdrawals),
-                        "other": round_money(t.other),
-                        "net_cashflow_excl_deposits": round_money(net_excl),
-                        "net_cashflow_incl_deposits": round_money(net_incl),
-                    },
-                }
-            )
+            window_record: WindowRecord = {
+                "kind": kind_str,  # type: ignore
+                "start": start_iso,
+                "end": next(
+                    w.end.isoformat()
+                    for w in windows
+                    if w.kind == kind_str and w.start.isoformat() == start_iso
+                ),
+                "currency": currency,
+                "stats": _totals_to_breakdown(t),
+            }
+
+            if kind_str == "day":
+                inst_key = (start_iso, currency)
+                inst_map = day_instrument_buckets.get(inst_key)
+                if inst_map:
+                    instruments: List[InstrumentBreakdown] = []
+                    for instrument_id, (instrument_name, totals) in inst_map.items():
+                        breakdown = _totals_to_breakdown(totals)
+                        instruments.append(
+                            {
+                                "instrument_id": instrument_id,
+                                "instrument_name": instrument_name,
+                                "currency": currency,
+                                "stats": breakdown,
+                            }
+                        )
+                    instruments.sort(
+                        key=lambda item: (
+                            -item["stats"]["net_cashflow_excl_deposits"],
+                            item["instrument_name"],
+                        )
+                    )
+                    window_record["instruments"] = instruments
+
+            out_windows.append(window_record)
 
     meta: MetaInfo = {
         "timezone": tz_name,
